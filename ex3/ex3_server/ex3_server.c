@@ -6,26 +6,35 @@
 #include "common.h"
 
 
-typedef struct {
+typedef struct registration {
     char oper;
     int  rcvid_wc;
 } registration_t;
 
-#define MAX_WORKERS 100
+#define MAX_WORKERS 1024
 registration_t regs[MAX_WORKERS];
 int nregs = 0;
 
 static int find_worker(char oper) {
-    for (int i = 0; i < nregs; i++) {
+	int i = 0;
+    for (i = 0; i < nregs; i++) {
         if (regs[i].oper == oper && regs[i].rcvid_wc != -1)
             return i;
     }
     return -1;
 }
 
+void rcvid_to_null(int rcvid) {
+	int i = 0;
+    for (i = 0; i < nregs; i++) {
+        if (regs[i].rcvid_wc == rcvid && regs[i].rcvid_wc != -1)
+            regs[i].rcvid_wc = 0;
+    }
+}
+
 int main(void) {
     name_attach_t *attach;
-    msg_t          msg;
+    my_msg_t          msg;
     int            rcvid;
 
     printf("Server starting...\n");
@@ -45,15 +54,25 @@ int main(void) {
         }
 
         if (rcvid == 0) {
+        	int id = 0;
             switch (msg.hdr.code) {
             case _PULSE_CODE_DISCONNECT:
                 ConnectDetach(msg.hdr.scoid);
+                id = msg.hdr.value.sival_int;
+                rcvid_to_null(id);
                 break;
-            default:
-                break;
-            }
-            continue;
-        }
+            case _PULSE_CODE_UNBLOCK:
+            	ConnectDetach(msg.hdr.scoid);
+            	id = msg.hdr.value.sival_int;
+            	rcvid_to_null(id);
+				break;
+			   break;
+		   default:
+			   break;
+			   }
+		   continue;
+		   }
+
 
         if (msg.hdr.type == _IO_CONNECT) {
             MsgReply(rcvid, EOK, NULL, 0);
@@ -71,18 +90,31 @@ int main(void) {
             printf("Server: worker registered for '%c' (rcvid=%d)\n", msg.oper, rcvid);
 
             int slot = -1;
-            for (int i = 0; i < nregs; i++)
-                if (regs[i].oper == msg.oper) { slot = i; break; }
+            int i = 0;
+            int error = 0;
+            for (i = 0; i < nregs; i++) {
+                if (regs[i].rcvid_wc != 0 && regs[i].oper == msg.oper) {
+                	error = 1;
+                	break;
+                } else if (regs[i].rcvid_wc == 0 && regs[i].oper == msg.oper) {
+                	regs[i].rcvid_wc = rcvid;
+                	error = 2;
+                	break;
+                }
+            }
 
-            if (slot == -1 && nregs < MAX_WORKERS) {
+            if (error == 0 && slot == -1 && nregs < MAX_WORKERS) {
                 slot = nregs++;
                 regs[slot].oper = msg.oper;
             }
-            if (slot != -1) {
+            if (error == 0 && slot != -1) {
                 regs[slot].rcvid_wc = rcvid;
                 /* Do NOT reply yet, the worker stays blocked waiting for a job */
+            }
+            else if (error == 2) {
+            	continue;
             } else {
-                MsgError(rcvid, ENOMEM);
+                MsgError(rcvid, EBADSLT);
             }
 
         } else if (msg.type == 'o') {
@@ -92,22 +124,25 @@ int main(void) {
             printf("Server: request from euc: %d %c %d\n", msg.arg1, msg.oper, msg.arg2);
 
             int slot = find_worker(msg.oper);
-            if (slot == -1) {
+            if (slot == -1 || regs[slot].rcvid_wc == 0) {
                 printf("Server: no worker available for '%c'\n", msg.oper);
-                MsgError(rcvid, ENOSYS);
+                my_msg_t job = msg;
+				job.type = 'e';
+				job.rcvid_euc = rcvid;
+
+				MsgReply(rcvid, EOK, &job, sizeof(job));
                 continue;
+            } else {
+                my_msg_t job = msg;
+                job.type = 'o';
+                job.rcvid_euc = rcvid;
+
+                int wc_rcvid = regs[slot].rcvid_wc;
+                regs[slot].rcvid_wc = -1;
+
+                MsgReply(wc_rcvid, EOK, &job, sizeof(job));
+                /* The euc stays blocked until the worker sends the answer */
             }
-
-            msg_t job = msg;
-            job.type = 'o';
-            job.rcvid_euc = rcvid;
-
-            int wc_rcvid = regs[slot].rcvid_wc;
-            regs[slot].rcvid_wc = -1;
-
-            MsgReply(wc_rcvid, EOK, &job, sizeof(job));
-            /* The euc stays blocked until the worker sends the answer */
-
         } else if (msg.type == 'a') {
             /*
              * Worker has finished
@@ -119,7 +154,9 @@ int main(void) {
 
             int slot = find_worker(msg.oper);
 
-            for (int i = 0; i < nregs; i++) {
+            int i = 0;
+
+            for (i = 0; i < nregs; i++) {
                 if (regs[i].oper == msg.oper) {
                     regs[i].rcvid_wc = rcvid;
                     break;
