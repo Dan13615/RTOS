@@ -1,3 +1,17 @@
+/*
+ * ex3_add_client.c - worker client for the '+' operator.
+ *
+ * Idea:
+ *   1. Open a connection to the server by name.
+ *   2. Send a registration message (type 'r', oper '+') and stay BLOCKED
+ *      on that MsgSend. The server holds our rcvid and replies only when
+ *      a real job arrives, so MsgSend acts as a "wait for a job" call.
+ *   3. When we unblock, recv_msg contains a job (type 'o'): do the math
+ *      and loop back with a new MsgSend of type 'a' (answer). That next
+ *      MsgSend doubles as "here is the result" AND "I am ready again".
+ *
+ * Only one '+' worker can run at a time - the server refuses duplicates.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +36,8 @@ int main(int argc, char *argv[]) {
     my_msg_t send_msg, recv_msg;
     memset(&send_msg, 0, sizeof(send_msg));
 
+    /* First MsgSend is the registration ('r'). Later iterations will
+     * reuse send_msg with type 'a' to send back results. */
     send_msg.type = 'r';
     send_msg.oper = oper;
 
@@ -37,6 +53,9 @@ int main(int argc, char *argv[]) {
             break;
         }
 
+        /* Do the work, then prepare the next MsgSend as an 'a' (answer).
+         * rcvid_euc is copied through so the server knows which end-user
+         * client is waiting for this result. */
         int a = recv_msg.arg1, b = recv_msg.arg2;
         int result = a + b;
         printf("Worker '%c': %d %c %d = %d\n", oper, a, oper, b, result);

@@ -1,3 +1,15 @@
+/*
+ * ex3_mul_client.c - worker client for the '*' operator.
+ *
+ * Same pattern as the other workers:
+ * - Register once with type 'r'. The MsgSend stays blocked, which
+ *  is how the worker "waits" for work.
+ * - When the server replies, we get a job (type 'o'). Compute it.
+ * - Send the result back with a new MsgSend of type 'a' - which
+ *     immediately blocks again, ready for the next job.
+ *
+ * Server only keeps one '*' worker alive at a time.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +34,7 @@ int main(int argc, char *argv[]) {
     my_msg_t send_msg, recv_msg;
     memset(&send_msg, 0, sizeof(send_msg));
 
+    /* Registration message - first and only 'r' send of this worker. */
     send_msg.type = 'r';
     send_msg.oper = oper;
 
@@ -37,6 +50,8 @@ int main(int argc, char *argv[]) {
             break;
         }
 
+        /* Compute and build the 'a' (answer) message. The rcvid_euc
+         * field tells the server which end-user is waiting. */
         int a = recv_msg.arg1, b = recv_msg.arg2;
         int result = a * b;
         printf("Worker '%c': %d %c %d = %d\n", oper, a, oper, b, result);

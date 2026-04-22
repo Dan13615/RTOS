@@ -1,3 +1,22 @@
+/*
+ * ex3_enduser_client.c - interactive user of the calculator.
+ *
+ * Role:
+ *   - Open a connection to the server by name.
+ *   - Prompt the user for "number operator number".
+ *   - Pack the input into a message of type 'o' (operation request) and
+ *     MsgSend it to the server. We then stay blocked until a reply
+ *     comes back.
+ *   - The reply is either:
+ *       type 'a' -> contains the result (normal case)
+ *       type 'e' -> no worker for this operator, or div-by-zero
+ *   - Type 'q' as operator to quit.
+ *
+ * Note: this client does NOT talk to the workers directly. It only
+ * speaks to the server, which is in charge of forwarding the job and
+ * routing the answer back. This client can always reach the server
+ * even if no worker is running - it will just get an 'e' reply.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,9 +31,10 @@ int main(void) {
     int   num1, num2, argsNum;
     my_msg_t send_msg, reply_msg;
 
+    /* Find the server by its published name. Fails if server not running. */
     server_coid = name_open(ATTACH_POINT, 0);
     if (server_coid == -1) {
-        perror("name_open – is the server running?");
+        perror("name_open ï¿½ is the server running?");
         return EXIT_FAILURE;
     }
     printf("Connected to calc_svr (coid=%d)\n", server_coid);
@@ -24,6 +44,9 @@ int main(void) {
         fflush(stdout);
         argsNum = scanf("%d %c %d", &num1, &operation, &num2);
 
+        /* Local input validation - we do not bother the server with
+         * malformed commands. On bad input we flush the rest of the
+         * line so the next scanf starts clean. */
         if (argsNum != 3) {
             printf("Bad input, try again.\n");
             while ((c = getchar()) != '\n' && c != EOF);
@@ -36,6 +59,9 @@ int main(void) {
             continue;
         }
 
+        /* Build the request ('o' = operation). MsgSend blocks until the
+         * server routes the job to a worker, gets the answer back, and
+         * replies to us. */
         memset(&send_msg, 0, sizeof(send_msg));
         send_msg.type   = 'o';
         send_msg.oper   = operation;
@@ -49,6 +75,8 @@ int main(void) {
             break;
         }
 
+		/* 'e' reply = worker missing or refused the op (e.g. div by 0).
+		 * Otherwise the reply carries the result the worker computed. */
 		if (reply_msg.type == 'e') {
 			printf("Error worker not active or operation not permitted\n");
 		} else {
