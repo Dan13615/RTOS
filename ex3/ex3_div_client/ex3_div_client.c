@@ -1,3 +1,17 @@
+/*
+ * ex3_div_client.c - worker client for the '/' operator.
+ *
+ * Same pattern as the other workers (register with 'r', then loop
+ * answering jobs with 'a'), with ONE extra case: division by zero.
+ *
+ * If the end-user asks "a / 0", we cannot compute a valid result. We
+ * send back a message of type 'e' (error) instead of 'a'. The server
+ * forwards that 'e' to the waiting end-user client so it can print an
+ * error message. In both cases the next MsgSend blocks the worker,
+ * making it ready for the next job.
+ *
+ * Only one '/' worker can register at a time.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +36,7 @@ int main(int argc, char *argv[]) {
     my_msg_t send_msg, recv_msg;
     memset(&send_msg, 0, sizeof(send_msg));
 
+    /* Registration: first MsgSend, stays blocked until server has a job. */
     send_msg.type = 'r';
     send_msg.oper = oper;
 
@@ -37,6 +52,9 @@ int main(int argc, char *argv[]) {
             break;
         }
 
+        /* Special case: b == 0. Send back 'e' instead of 'a' so the
+         * server knows to forward an error to the end-user, not a
+         * pretended result. */
         int a = recv_msg.arg1, b = recv_msg.arg2;
         if (b == 0) {
             fprintf(stderr, "Worker '%c': division by zero\n", oper);

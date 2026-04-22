@@ -1,3 +1,15 @@
+/*
+ * ex3_sub_client.c - worker client for the '-' operator.
+ *
+ * Same pattern as every worker:
+ *   1. name_open to find the server.
+ *   2. First MsgSend is a registration ('r') - stays blocked until
+ *      the server hands us a job.
+ *   3. Compute, then loop: the next MsgSend carries the answer ('a')
+ *      and also acts as "ready for next job" because we block on it.
+ *
+ * Only one '-' worker can be alive at once (server enforces it).
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +34,8 @@ int main(int argc, char *argv[]) {
     my_msg_t send_msg, recv_msg;
     memset(&send_msg, 0, sizeof(send_msg));
 
+    /* First send: registration. Server will keep us blocked on this
+     * MsgSend until a subtraction job is routed to us. */
     send_msg.type = 'r';
     send_msg.oper = oper;
 
@@ -37,6 +51,9 @@ int main(int argc, char *argv[]) {
             break;
         }
 
+        /* Job received: compute and prepare the answer message.
+         * rcvid_euc is forwarded so the server can route the reply
+         * back to the exact end-user client that asked. */
         int a = recv_msg.arg1, b = recv_msg.arg2;
         int result = a - b;
         printf("Worker '%c': %d %c %d = %d\n", oper, a, oper, b, result);
