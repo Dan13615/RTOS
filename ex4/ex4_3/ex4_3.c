@@ -43,9 +43,9 @@ int main()
     timer_create(CLOCK_MONOTONIC, &event2, &timer_id2);
 
     itime1.it_value.tv_sec = 0;
-    itime1.it_value.tv_nsec = 100000000;
+    itime1.it_value.tv_nsec = 10000000;
     itime1.it_interval.tv_sec = 0;
-    itime1.it_interval.tv_nsec = 100000000;
+    itime1.it_interval.tv_nsec = 10000000;
     itime2.it_value.tv_sec = 10;
     itime2.it_value.tv_nsec = 0;
     itime2.it_interval.tv_sec = 10;
