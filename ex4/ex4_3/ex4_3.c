@@ -53,7 +53,7 @@ int main()
     timer_settime(timer_id1, 0, &itime1, NULL);
     timer_settime(timer_id2, 0, &itime2, NULL);
 
-    int i, j = 0;
+    int i = 0, j = 0;
 
     for (;;) {
         rcvid = MsgReceive(chid, &msg, sizeof(msg), NULL);
