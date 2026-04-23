@@ -43,6 +43,10 @@ int main()
 
     for (;;) {
         rcvid = MsgReceive(chid, &msg, sizeof(msg), NULL);
+        if (rcvid == -1) {
+            perror("MsgReceive");
+            return(1);
+        }
         if (rcvid == 0) { 
             if (msg.pulse.code == MY_PULSE_CODE) {
                 printf("we got a pulse from our timer after 1.5 seconds\n");
