@@ -45,6 +45,10 @@ int main()
 
     for (;;) {
         rcvid = MsgReceive(chid, &msg, sizeof(msg), NULL);
+        if (rcvid == -1) {
+            perror("MsgReceive");
+            break;
+        }
         if (rcvid == 0) {
             if (msg.pulse.code == MY_PULSE_CODE) {
                 i++;
