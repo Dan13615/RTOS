@@ -33,12 +33,16 @@ int main()
     int coid = ConnectAttach(0, 0, chid, _NTO_SIDE_CHANNEL, 0);
     SIGEV_PULSE_INIT(&event, coid, prio, MY_PULSE_CODE, 0);
 
+    // make new timer
     timer_create(CLOCK_MONOTONIC, &event, &timer_id);
 
+    // first fire after 1.5 s
     itime.it_value.tv_sec = 1;
-    itime.it_value.tv_nsec = 500000000; 
+    itime.it_value.tv_nsec = 500000000;
+    // no repeat
     itime.it_interval.tv_sec = 0;
-    itime.it_interval.tv_nsec = 0; 
+    itime.it_interval.tv_nsec = 0;
+    // start timer
     timer_settime(timer_id, 0, &itime, NULL);
 
     for (;;) {
