@@ -39,17 +39,24 @@ int main()
     SIGEV_PULSE_INIT(&event1, coid, prio, PULSE_TIMER1, 0);
     SIGEV_PULSE_INIT(&event2, coid, prio, PULSE_TIMER2, 0);
 
+    // make two timers
     timer_create(CLOCK_MONOTONIC, &event1, &timer_id1);
     timer_create(CLOCK_MONOTONIC, &event2, &timer_id2);
 
+    // two timers on same channel: check if fast ticks get lost
+    // when slow one fires (expect ~1000 timer1 pulses per timer2)
+
+    // timer1: 10 ms (sec=0, nsec=10 000 000 ns = 10 ms)
     itime1.it_value.tv_sec = 0;
     itime1.it_value.tv_nsec = 10000000;
     itime1.it_interval.tv_sec = 0;
     itime1.it_interval.tv_nsec = 10000000;
+    // timer2: 10 s (sec=10, nsec=0)
     itime2.it_value.tv_sec = 10;
     itime2.it_value.tv_nsec = 0;
     itime2.it_interval.tv_sec = 10;
     itime2.it_interval.tv_nsec = 0;
+    // start both
     timer_settime(timer_id1, 0, &itime1, NULL);
     timer_settime(timer_id2, 0, &itime2, NULL);
 
