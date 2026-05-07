@@ -1,239 +1,142 @@
 /*
- * ex3_server.c — same reply-driven IPC as before, extended for sin client.
+ * sin_client.c - worker client for the 's' (sin) operator.
  *
- * NEW: sin worker ('s') registers differently:
- *   - It sends type 'r' / oper 's' plus its chid.
- *   - Server opens a connection to the sin client's chid and stores it.
- *   - Server replies immediately (EOK, empty) instead of keeping the rcvid.
- *   - When an euc requests 's', the server sends MY_PULSE_CODE to the sin
- *     client and saves the euc's rcvid. The sin client later sends 'a' back;
- *     the server forwards the result to the euc.
+ * Flow:
+ *  1. Create own channel + timer (100 ms tick).
+ *  2. Register with server via MsgSend('r', oper='s', chid=own chid).
+ *     Unlike arithmetic workers, we do NOT stay blocked on that send —
+ *     we want the reply immediately (EOK) so we can return to our pulse loop.
+ *     The server stores our coid (opened via ConnectAttach to our chid).
+ *  3. Loop on MsgReceivePulse(chid):
+ *       TIMER pulse  -> increment counter, recompute sin (scaled x1000)
+ *       MY_PULSE_CODE (from server) -> send MsgSend('a') to server with result
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <sys/dispatch.h>
+#include <math.h>
 #include "common.h"
 
-typedef struct registration {
-    char oper;
-    int  rcvid_wc;       /* >0 idle, -1 busy, 0 free — same as before   */
-    int  sin_coid;       /* *** NEW *** coid to pulse sin worker (oper=='s' only) */
-} registration_t;
+#define TIMER_PULSE_CODE (_PULSE_CODE_MINAVAIL + 1)  /* must differ from MY_PULSE_CODE */
 
-#define MAX_WORKERS 1024
-registration_t regs[MAX_WORKERS];
-int nregs = 0;
-
-/* *** NEW *** pending euc rcvid waiting for sin result (-1 = none) */
-static int pending_sin_euc = -1;
-
-static int find_worker(char oper) {
-    int i;
-    for (i = 0; i < nregs; i++)
-        if (regs[i].oper == oper && regs[i].rcvid_wc != -1)
-            return i;
-    return -1;
-}
-
-void rcvid_to_null(int rcvid) {
-    int i;
-    for (i = 0; i < nregs; i++)
-        if (regs[i].rcvid_wc == rcvid && regs[i].rcvid_wc != -1)
-            regs[i].rcvid_wc = 0;
-}
+int server_coid = -1;
 
 int main(void) {
-    name_attach_t *attach;
-    my_msg_t       msg;
-    int            rcvid;
-    struct _msg_info info;
+    struct sigevent   event;
+    struct itimerspec itime;
+    timer_t           timer_id;
+    int               chid, coid;
+    struct sched_param sp;
+    int               prio;
+    int               timer_count = 0;
+    int               sinT        = 0;     /* sin(timer_count)*1000, integer scaled */
+    char 			  worker_type = 'g';
 
-    printf("Server starting...\n");
+    /* ── 1. Create our own channel ── */
+    chid = ChannelCreate(0);
+    if (chid == -1) { perror("ChannelCreate"); return EXIT_FAILURE; }
 
-    if ((attach = name_attach(NULL, ATTACH_POINT, 0)) == NULL) {
-        perror("name_attach"); return EXIT_FAILURE;
+    /* ── 2. Self-connection so we can send pulses to ourselves ── */
+    coid = ConnectAttach(0, 0, chid, _NTO_SIDE_CHANNEL, 0);
+    if (coid == -1) { perror("ConnectAttach"); return EXIT_FAILURE; }
+
+    /* ── 3. Timer: 100 ms repeating, fires TIMER_PULSE_CODE pulse ── */
+    if (SchedGet(0, 0, &sp) != -1)
+        prio = sp.sched_priority;
+    else
+        prio = 10;
+
+    SIGEV_PULSE_INIT(&event, coid, prio, TIMER_PULSE_CODE, 0);
+    if (timer_create(CLOCK_MONOTONIC, &event, &timer_id) == -1) {
+        perror("timer_create"); return EXIT_FAILURE;
     }
-    printf("name_attach OK, registered as '%s'\n", ATTACH_POINT);
+    itime.it_value.tv_sec     = 0;
+    itime.it_value.tv_nsec    = 100000000;   /* 100 ms first fire */
+    itime.it_interval.tv_sec  = 0;
+    itime.it_interval.tv_nsec = 100000000;   /* 100 ms period     */
+    timer_settime(timer_id, 0, &itime, NULL);
 
+    /* ── 4. Connect to server ── */
+    server_coid = name_open(ATTACH_POINT, 0);
+    if (server_coid == -1) { perror("name_open"); return EXIT_FAILURE; }
+    printf("sin_client: connected to server (coid=%d)\n", server_coid);
+
+    /* ── 5. Register with server ──
+     *
+     * We pass our chid so the server can call ConnectAttach()+MsgSendPulse()
+     * back to us later.  We expect an immediate EOK reply (unlike arithmetic
+     * workers that stay blocked here).
+     */
+    my_msg_t send_msg, recv_msg;
+    memset(&send_msg, 0, sizeof(send_msg));
+    send_msg.type = 'r';
+    send_msg.oper = worker_type;
+    send_msg.chid = chid;          /* tell server where to pulse us */
+
+    if (MsgSend(server_coid, &send_msg, sizeof(send_msg),
+                &recv_msg, sizeof(recv_msg)) == -1) {
+        perror("MsgSend register"); return EXIT_FAILURE;
+    }
+    printf("sin_client: registered with server, entering pulse loop\n");
+
+    /* ── 6. Main pulse loop ── */
     while (1) {
-        rcvid = MsgReceive(attach->chid, &msg, sizeof(msg), &info);
-        if (rcvid == -1) { perror("MsgReceive"); break; }
+        struct _pulse pulse;
+        /*
+         * MsgReceivePulse blocks on OUR channel (chid), not on server_coid.
+         * Two pulse codes can arrive:
+         *   TIMER_PULSE_CODE : 100 ms tick → update counter & sin value
+         *   MY_PULSE_CODE    : server asking for current sin value
+         */
+        int rc = MsgReceivePulse(chid, &pulse, sizeof(pulse), NULL);
+        if (rc == -1) { perror("MsgReceivePulse"); break; }
 
-        /* ── Pulse handling (unchanged) ── */
-        if (rcvid == 0) {
-            int id = 0;
-            switch (msg.hdr.code) {
-            case _PULSE_CODE_DISCONNECT:
-                ConnectDetach(msg.hdr.scoid);
-                id = msg.hdr.value.sival_int;
-                rcvid_to_null(id);
-                break;
-            case _PULSE_CODE_UNBLOCK:
-                ConnectDetach(msg.hdr.scoid);
-                id = msg.hdr.value.sival_int;
-                rcvid_to_null(id);
-                break;
-            default:
-                break;
-            }
-            continue;
-        }
+        switch (pulse.code) {
+			case TIMER_PULSE_CODE:
+				timer_count++;
+				/* Scale to integer: store sin()*1000 so we keep 3 decimal digits */
+				sinT = (int)(sin((double)timer_count) * 1000.0);
+				/* Uncomment for debugging the counter:
+				* printf("sin_client: tick %d  sin=%d (x1000)\n", timer_count, sinT);
+				*/
+				break;
 
-        if (msg.hdr.type == _IO_CONNECT) { MsgReply(rcvid, EOK, NULL, 0); continue; }
-        if (msg.hdr.type > _IO_BASE && msg.hdr.type <= _IO_MAX) { MsgError(rcvid, ENOSYS); continue; }
+			case MY_PULSE_CODE:
+				/*
+				* Server pulsed us: it has an euc waiting for sin(counter).
+				* Reply by sending an 'a' (answer) message to the server.
+				* This MsgSend also blocks until the server replies, but that
+				* reply arrives almost immediately (server does MsgReply to us
+				* as an ack, then forwards sinT to the euc).
+				*/
+				printf("sin_client: pulse from server, sending sin(%d)=%d (x1000)\n",
+					timer_count, sinT);
 
-        /* ── 'r' : worker registration ── */
-        if (msg.type == 'r') {
-            printf("Server: worker registered for '%c' (rcvid=%d)\n", msg.oper, rcvid);
+				memset(&send_msg, 0, sizeof(send_msg));
+				send_msg.type   = 'a';
+				send_msg.oper   = worker_type;
+				send_msg.result = sinT;
+				/* rcvid_euc will be filled in by the server when it stored
+				* the pending euc — we do not know it here, leave 0 */
 
-            /* *** NEW *** sin client registers differently */
-            if (msg.oper == 's') {
-                /*
-                 * Check for duplicate sin worker.
-                 */
-                int i, found = -1;
-                for (i = 0; i < nregs; i++) {
-                    if (regs[i].oper == 's') { found = i; break; }
-                }
-                if (found != -1 && regs[found].sin_coid != 0) {
-                    /* already have one, reject */
-                    MsgError(rcvid, EBADSLT);
-                } else {
-                    /* Open a connection to the sin client's channel */
-                    int sc = ConnectAttach(0, info.pid, msg.chid, _NTO_SIDE_CHANNEL, 0);
-                    if (sc == -1) {
-                        perror("ConnectAttach to sin client");
-                        MsgError(rcvid, errno);
-                    } else {
-                        if (found == -1) {
-                            found = nregs++;
-                            regs[found].oper    = 's';
-                            regs[found].rcvid_wc = 1; /* mark as "available" */
-                        }
-                        regs[found].sin_coid = sc;
-                        /*
-                         * Reply immediately — sin client must NOT stay blocked.
-                         * It needs to return to its timer/pulse loop.
-                         */
-                        MsgReply(rcvid, EOK, NULL, 0);
-                        printf("Server: sin worker registered, sin_coid=%d\n", sc);
-                    }
-                }
-            } else {
-                /* ── arithmetic worker registration (unchanged logic) ── */
-                int slot = -1, i, error = 0;
-                for (i = 0; i < nregs; i++) {
-                    if (regs[i].rcvid_wc != 0 && regs[i].oper == msg.oper) {
-                        error = 1; break;
-                    } else if (regs[i].rcvid_wc == 0 && regs[i].oper == msg.oper) {
-                        regs[i].rcvid_wc = rcvid; error = 2; break;
-                    }
-                }
-                if (error == 0 && slot == -1 && nregs < MAX_WORKERS) {
-                    slot = nregs++;
-                    regs[slot].oper = msg.oper;
-                }
-                if (error == 0 && slot != -1)
-                    regs[slot].rcvid_wc = rcvid;   /* worker stays blocked */
-                else if (error == 2)
-                    continue;                        /* slot refreshed, do nothing */
-                else
-                    MsgError(rcvid, EBADSLT);        /* duplicate, reject */
-            }
+				if (MsgSend(server_coid, &send_msg, sizeof(send_msg),
+							&recv_msg, sizeof(recv_msg)) == -1) {
+					perror("MsgSend answer"); break;
+				}
+				/* Server acked our 'a' → we're free to keep ticking */
+				break;
 
-        /* ── 'o' : end-user operation request ── */
-        } else if (msg.type == 'o') {
-            printf("Server: request from euc: %d %c %d\n", msg.arg1, msg.oper, msg.arg2);
-
-            /* *** NEW *** handle sin operation via pulse */
-            if (msg.oper == 's') {
-                int i, found = -1;
-                for (i = 0; i < nregs; i++)
-                    if (regs[i].oper == 's' && regs[i].sin_coid != 0) { found = i; break; }
-
-                if (found == -1) {
-                    /* no sin worker registered */
-                    my_msg_t err = msg;
-                    err.type = 'e';
-                    MsgReply(rcvid, EOK, &err, sizeof(err));
-                } else if (pending_sin_euc != -1) {
-                    /* already one euc waiting for sin — busy */
-                    my_msg_t err = msg;
-                    err.type = 'e';
-                    MsgReply(rcvid, EOK, &err, sizeof(err));
-                } else {
-                    /*
-                     * Save the euc's rcvid, then pulse the sin client.
-                     * The euc stays BLOCKED until we get the 'a' back.
-                     */
-                    pending_sin_euc = rcvid;
-                    if (MsgSendPulse(regs[found].sin_coid, -1, MY_PULSE_CODE, 0) == -1) {
-                        perror("MsgSendPulse to sin client");
-                        my_msg_t err = msg;
-                        err.type = 'e';
-                        MsgReply(rcvid, EOK, &err, sizeof(err));
-                        pending_sin_euc = -1;
-                    } else {
-                        printf("Server: pulsed sin client, euc rcvid=%d saved\n", rcvid);
-                        /* euc stays blocked here — 'a' from sin client will unblock it */
-                    }
-                }
-            } else {
-                /* ── arithmetic operation (unchanged) ── */
-                int slot = find_worker(msg.oper);
-                if (slot == -1 || regs[slot].rcvid_wc == 0) {
-                    my_msg_t job = msg;
-                    job.type = 'e';
-                    MsgReply(rcvid, EOK, &job, sizeof(job));
-                } else {
-                    my_msg_t job = msg;
-                    job.type      = 'o';
-                    job.rcvid_euc = rcvid;
-                    int wc_rcvid  = regs[slot].rcvid_wc;
-                    regs[slot].rcvid_wc = -1;
-                    MsgReply(wc_rcvid, EOK, &job, sizeof(job));
-                    /* euc stays blocked */
-                }
-            }
-
-        /* ── 'a' : worker answer ── */
-        } else if (msg.type == 'a') {
-
-            /* *** NEW *** sin client sends 'a' back as a MsgSend */
-            if (msg.oper == 's') {
-                printf("Server: sin answer = %d (x1000)\n", msg.result);
-                if (pending_sin_euc != -1) {
-                    my_msg_t reply = msg;
-                    reply.type = 'a';
-                    MsgReply(pending_sin_euc, EOK, &reply, sizeof(reply));
-                    pending_sin_euc = -1;
-                }
-                /* Ack the sin client's MsgSend so it can return to its loop */
-                MsgReply(rcvid, EOK, NULL, 0);
-
-            } else {
-                /* ── arithmetic answer (unchanged) ── */
-                printf("Server: answer from worker: result=%d\n", msg.result);
-                MsgReply(msg.rcvid_euc, EOK, &msg, sizeof(msg));
-                int i;
-                for (i = 0; i < nregs; i++) {
-                    if (regs[i].oper == msg.oper) {
-                        regs[i].rcvid_wc = rcvid;
-                        break;
-                    }
-                }
-            }
-
-        /* ── 'e' : worker error (unchanged) ── */
-        } else if (msg.type == 'e') {
-            printf("Server: error from worker: %c (divide by 0)\n", msg.oper);
-            MsgReply(msg.rcvid_euc, EOK, &msg, sizeof(msg));
+			default:
+				printf("sin_client: unknown pulse code %d\n", pulse.code);
+				break;
         }
     }
 
-    name_detach(attach, 0);
-    printf("Server exit.\n");
+    timer_delete(timer_id);
+    name_close(server_coid);
+    printf("sin_client: exit.\n");
     return EXIT_SUCCESS;
 }
