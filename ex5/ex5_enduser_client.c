@@ -54,10 +54,10 @@ int main(void) {
         }
         if (operation == 'q')
             break;
-        if (strchr("+-*/s", operation) == NULL) {
-            printf("Operation '%c' not supported. Use + - * / s\n", operation);
-            continue;
-        }
+//        if (strchr("+-*/s", operation) == NULL) {
+//            printf("Operation '%c' not supported. Use + - * / s\n", operation);
+//            continue;
+//        }
 
         /* Build the request ('o' = operation). MsgSend blocks until the
          * server routes the job to a worker, gets the answer back, and

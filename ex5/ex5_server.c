@@ -1,13 +1,12 @@
 /*
- * ex3_server.c — same reply-driven IPC as before, extended for sin client.
+ * ex5_server.c — generic server supporting both reply-driven and
+ * pulse-driven workers for ANY operator.
  *
- * NEW: sin worker ('s') registers differently:
- *   - It sends type 'r' / oper 's' plus its chid.
- *   - Server opens a connection to the sin client's chid and stores it.
- *   - Server replies immediately (EOK, empty) instead of keeping the rcvid.
- *   - When an euc requests 's', the server sends MY_PULSE_CODE to the sin
- *     client and saves the euc's rcvid. The sin client later sends 'a' back;
- *     the server forwards the result to the euc.
+ * How the server decides:
+ *   - Registration msg with chid != 0  →  pulse-driven worker
+ *   - Registration msg with chid == 0  →  reply-driven worker
+ *
+ * Only one worker per operator at a time, regardless of comm style.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,21 +17,29 @@
 
 typedef struct registration {
     char oper;
-    int  rcvid_wc;       /* >0 idle, -1 busy, 0 free — same as before   */
-    int  sin_coid;       /* *** NEW *** coid to pulse sin worker (oper=='s' only) */
+    int  rcvid_wc;       /* reply-driven: >0 idle, -1 busy, 0 free      */
+    int  pulse_coid;     /* pulse-driven: coid to pulse worker (0 = n/a) */
+    int  pending_euc;    /* pulse-driven: rcvid of euc waiting (-1 none) */
 } registration_t;
 
 #define MAX_WORKERS 1024
 registration_t regs[MAX_WORKERS];
 int nregs = 0;
 
-/* *** NEW *** pending euc rcvid waiting for sin result (-1 = none) */
-static int pending_sin_euc = -1;
-
 static int find_worker(char oper) {
     int i;
     for (i = 0; i < nregs; i++)
-        if (regs[i].oper == oper && regs[i].rcvid_wc != -1)
+        if (regs[i].oper == oper &&
+            (regs[i].rcvid_wc > 0 || regs[i].pulse_coid != 0))
+            return i;
+    return -1;
+}
+
+static int find_reg(char oper) {
+    int i;
+    for (i = 0; i < nregs; i++)
+        if (regs[i].oper == oper &&
+            (regs[i].rcvid_wc != 0 || regs[i].pulse_coid != 0))
             return i;
     return -1;
 }
@@ -48,6 +55,7 @@ int main(void) {
     name_attach_t *attach;
     my_msg_t       msg;
     int            rcvid;
+    struct _msg_info info;
 
     printf("Server starting...\n");
 
@@ -57,7 +65,7 @@ int main(void) {
     printf("name_attach OK, registered as '%s'\n", ATTACH_POINT);
 
     while (1) {
-        rcvid = MsgReceive(attach->chid, &msg, sizeof(msg), NULL);
+    	rcvid = MsgReceive(attach->chid, &msg, sizeof(msg), &info);
         if (rcvid == -1) { perror("MsgReceive"); break; }
 
         /* ── Pulse handling (unchanged) ── */
@@ -85,144 +93,118 @@ int main(void) {
 
         /* ── 'r' : worker registration ── */
         if (msg.type == 'r') {
-            printf("Server: worker registered for '%c' (rcvid=%d)\n", msg.oper, rcvid);
+            printf("Server: worker '%c' registering (rcvid=%d, chid=%d)\n",
+                   msg.oper, rcvid, msg.chid);
 
-            /* *** NEW *** sin client registers differently */
-            if (msg.oper == 's') {
-                /*
-                 * Check for duplicate sin worker.
-                 */
-                int i, found = -1;
-                for (i = 0; i < nregs; i++) {
-                    if (regs[i].oper == 's') { found = i; break; }
+            /* Universal duplicate check — one worker per oper, any comm style */
+            int i, dup = 0, reuse = -1;
+            for (i = 0; i < nregs; i++) {
+                if (regs[i].oper != msg.oper) continue;
+                if (regs[i].rcvid_wc > 0 || regs[i].rcvid_wc == -1
+                    || regs[i].pulse_coid != 0) {
+                    dup = 1; break;
                 }
-                if (found != -1 && regs[found].sin_coid != 0) {
-                    /* already have one, reject */
-                    MsgError(rcvid, EBADSLT);
+                if (regs[i].rcvid_wc == 0 && regs[i].pulse_coid == 0)
+                    reuse = i;
+            }
+            if (dup) {
+                MsgError(rcvid, EBADSLT);
+
+            } else if (msg.chid != 0) {
+                /* ── Pulse-driven registration ── */
+                int sc = ConnectAttach(0, info.pid, msg.chid, _NTO_SIDE_CHANNEL, 0);
+                if (sc == -1) {
+                    perror("ConnectAttach to pulse client");
+                    MsgError(rcvid, errno);
                 } else {
-                    /* Open a connection to the sin client's channel */
-                    int sc = ConnectAttach(0, 0, msg.chid, _NTO_SIDE_CHANNEL, 0);
-                    if (sc == -1) {
-                        perror("ConnectAttach to sin client");
-                        MsgError(rcvid, errno);
-                    } else {
-                        if (found == -1) {
-                            found = nregs++;
-                            regs[found].oper    = 's';
-                            regs[found].rcvid_wc = 1; /* mark as "available" */
-                        }
-                        regs[found].sin_coid = sc;
-                        /*
-                         * Reply immediately — sin client must NOT stay blocked.
-                         * It needs to return to its timer/pulse loop.
-                         */
-                        MsgReply(rcvid, EOK, NULL, 0);
-                        printf("Server: sin worker registered, sin_coid=%d\n", sc);
-                    }
+                    int slot = (reuse != -1) ? reuse : nregs++;
+                    regs[slot].oper       = msg.oper;
+                    regs[slot].rcvid_wc   = 0;
+                    regs[slot].pulse_coid = sc;
+                    regs[slot].pending_euc = -1;
+                    MsgReply(rcvid, EOK, NULL, 0);
+                    printf("Server: pulse-driven '%c' registered, coid=%d\n",
+                           msg.oper, sc);
                 }
+
             } else {
-                /* ── arithmetic worker registration (unchanged logic) ── */
-                int slot = -1, i, error = 0;
-                for (i = 0; i < nregs; i++) {
-                    if (regs[i].rcvid_wc != 0 && regs[i].oper == msg.oper) {
-                        error = 1; break;
-                    } else if (regs[i].rcvid_wc == 0 && regs[i].oper == msg.oper) {
-                        regs[i].rcvid_wc = rcvid; error = 2; break;
-                    }
-                }
-                if (error == 0 && slot == -1 && nregs < MAX_WORKERS) {
-                    slot = nregs++;
-                    regs[slot].oper = msg.oper;
-                }
-                if (error == 0 && slot != -1)
-                    regs[slot].rcvid_wc = rcvid;   /* worker stays blocked */
-                else if (error == 2)
-                    continue;                        /* slot refreshed, do nothing */
-                else
-                    MsgError(rcvid, EBADSLT);        /* duplicate, reject */
+                /* ── Reply-driven registration ── */
+                int slot = (reuse != -1) ? reuse : nregs++;
+                regs[slot].oper       = msg.oper;
+                regs[slot].rcvid_wc   = rcvid;
+                regs[slot].pulse_coid = 0;
+                regs[slot].pending_euc = -1;
+                printf("Server: reply-driven '%c' registered, rcvid=%d\n",
+                       msg.oper, rcvid);
             }
 
         /* ── 'o' : end-user operation request ── */
         } else if (msg.type == 'o') {
             printf("Server: request from euc: %d %c %d\n", msg.arg1, msg.oper, msg.arg2);
 
-            /* *** NEW *** handle sin operation via pulse */
-            if (msg.oper == 's') {
-                int i, found = -1;
-                for (i = 0; i < nregs; i++)
-                    if (regs[i].oper == 's' && regs[i].sin_coid != 0) { found = i; break; }
+            int slot = find_worker(msg.oper);
+            if (slot == -1) {
+                my_msg_t err = msg;
+                err.type = 'e';
+                MsgReply(rcvid, EOK, &err, sizeof(err));
 
-                if (found == -1) {
-                    /* no sin worker registered */
-                    my_msg_t err = msg;
-                    err.type = 'e';
-                    MsgReply(rcvid, EOK, &err, sizeof(err));
-                } else if (pending_sin_euc != -1) {
-                    /* already one euc waiting for sin — busy */
+            } else if (regs[slot].pulse_coid != 0) {
+                /* ── Pulse-driven worker ── */
+                if (regs[slot].pending_euc != -1) {
                     my_msg_t err = msg;
                     err.type = 'e';
                     MsgReply(rcvid, EOK, &err, sizeof(err));
                 } else {
-                    /*
-                     * Save the euc's rcvid, then pulse the sin client.
-                     * The euc stays BLOCKED until we get the 'a' back.
-                     */
-                    pending_sin_euc = rcvid;
-                    if (MsgSendPulse(regs[found].sin_coid, -1, MY_PULSE_CODE, 0) == -1) {
-                        perror("MsgSendPulse to sin client");
+                    regs[slot].pending_euc = rcvid;
+                    if (MsgSendPulse(regs[slot].pulse_coid, -1,
+                                     MY_PULSE_CODE, 0) == -1) {
+                        perror("MsgSendPulse to pulse client");
                         my_msg_t err = msg;
                         err.type = 'e';
                         MsgReply(rcvid, EOK, &err, sizeof(err));
-                        pending_sin_euc = -1;
+                        regs[slot].pending_euc = -1;
                     } else {
-                        printf("Server: pulsed sin client, euc rcvid=%d saved\n", rcvid);
-                        /* euc stays blocked here — 'a' from sin client will unblock it */
+                        printf("Server: pulsed '%c' worker, euc rcvid=%d saved\n",
+                               msg.oper, rcvid);
                     }
                 }
+
+            } else if (regs[slot].rcvid_wc > 0) {
+                /* ── Reply-driven worker (idle) ── */
+                my_msg_t job = msg;
+                job.type      = 'o';
+                job.rcvid_euc = rcvid;
+                int wc_rcvid  = regs[slot].rcvid_wc;
+                regs[slot].rcvid_wc = -1;
+                MsgReply(wc_rcvid, EOK, &job, sizeof(job));
+
             } else {
-                /* ── arithmetic operation (unchanged) ── */
-                int slot = find_worker(msg.oper);
-                if (slot == -1 || regs[slot].rcvid_wc == 0) {
-                    my_msg_t job = msg;
-                    job.type = 'e';
-                    MsgReply(rcvid, EOK, &job, sizeof(job));
-                } else {
-                    my_msg_t job = msg;
-                    job.type      = 'o';
-                    job.rcvid_euc = rcvid;
-                    int wc_rcvid  = regs[slot].rcvid_wc;
-                    regs[slot].rcvid_wc = -1;
-                    MsgReply(wc_rcvid, EOK, &job, sizeof(job));
-                    /* euc stays blocked */
-                }
+                /* worker registered but busy */
+                my_msg_t err = msg;
+                err.type = 'e';
+                MsgReply(rcvid, EOK, &err, sizeof(err));
             }
 
         /* ── 'a' : worker answer ── */
         } else if (msg.type == 'a') {
+            printf("Server: answer for '%c': result=%d\n", msg.oper, msg.result);
 
-            /* *** NEW *** sin client sends 'a' back as a MsgSend */
-            if (msg.oper == 's') {
-                printf("Server: sin answer = %d (x1000)\n", msg.result);
-                if (pending_sin_euc != -1) {
+            int slot = find_reg(msg.oper);
+            if (slot != -1 && regs[slot].pulse_coid != 0) {
+                /* ── Pulse-driven answer ── */
+                if (regs[slot].pending_euc != -1) {
                     my_msg_t reply = msg;
                     reply.type = 'a';
-                    MsgReply(pending_sin_euc, EOK, &reply, sizeof(reply));
-                    pending_sin_euc = -1;
+                    MsgReply(regs[slot].pending_euc, EOK, &reply, sizeof(reply));
+                    regs[slot].pending_euc = -1;
                 }
-                /* Ack the sin client's MsgSend so it can return to its loop */
                 MsgReply(rcvid, EOK, NULL, 0);
 
             } else {
-                /* ── arithmetic answer (unchanged) ── */
-                printf("Server: answer from worker: result=%d\n", msg.result);
+                /* ── Reply-driven answer ── */
                 MsgReply(msg.rcvid_euc, EOK, &msg, sizeof(msg));
-                int i;
-                for (i = 0; i < nregs; i++) {
-                    if (regs[i].oper == msg.oper) {
-                        regs[i].rcvid_wc = rcvid;
-                        break;
-                    }
-                }
+                if (slot != -1)
+                    regs[slot].rcvid_wc = rcvid;
             }
 
         /* ── 'e' : worker error (unchanged) ── */

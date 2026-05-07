@@ -33,6 +33,7 @@ int main(void) {
     int               prio;
     int               timer_count = 0;
     int               sinT        = 0;     /* sin(timer_count)*1000, integer scaled */
+    char 			  worker_type = 's';
 
     /* ── 1. Create our own channel ── */
     chid = ChannelCreate(0);
@@ -72,7 +73,7 @@ int main(void) {
     my_msg_t send_msg, recv_msg;
     memset(&send_msg, 0, sizeof(send_msg));
     send_msg.type = 'r';
-    send_msg.oper = 's';
+    send_msg.oper = worker_type;
     send_msg.chid = chid;          /* tell server where to pulse us */
 
     if (MsgSend(server_coid, &send_msg, sizeof(send_msg),
@@ -116,7 +117,7 @@ int main(void) {
 
 				memset(&send_msg, 0, sizeof(send_msg));
 				send_msg.type   = 'a';
-				send_msg.oper   = 's';
+				send_msg.oper   = worker_type;
 				send_msg.result = sinT;
 				/* rcvid_euc will be filled in by the server when it stored
 				* the pending euc — we do not know it here, leave 0 */
