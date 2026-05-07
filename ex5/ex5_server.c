@@ -48,6 +48,7 @@ int main(void) {
     name_attach_t *attach;
     my_msg_t       msg;
     int            rcvid;
+    struct _msg_info info;
 
     printf("Server starting...\n");
 
@@ -57,7 +58,7 @@ int main(void) {
     printf("name_attach OK, registered as '%s'\n", ATTACH_POINT);
 
     while (1) {
-        rcvid = MsgReceive(attach->chid, &msg, sizeof(msg), NULL);
+        rcvid = MsgReceive(attach->chid, &msg, sizeof(msg), &info);
         if (rcvid == -1) { perror("MsgReceive"); break; }
 
         /* ── Pulse handling (unchanged) ── */
@@ -101,7 +102,7 @@ int main(void) {
                     MsgError(rcvid, EBADSLT);
                 } else {
                     /* Open a connection to the sin client's channel */
-                    int sc = ConnectAttach(0, 0, msg.chid, _NTO_SIDE_CHANNEL, 0);
+                    int sc = ConnectAttach(0, info.pid, msg.chid, _NTO_SIDE_CHANNEL, 0);
                     if (sc == -1) {
                         perror("ConnectAttach to sin client");
                         MsgError(rcvid, errno);
