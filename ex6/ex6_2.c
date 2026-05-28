@@ -1,12 +1,6 @@
 /*
- * RTOS-06 Exercise – Part 3 & 4
- * Creates N child processes, each using a different scheduling algorithm:
- *   SCHED_FIFO, SCHED_RR (Round Robin), SCHED_SPORADIC
- * All children run at the SAME priority so the comparison is fair.
- * Each child performs CPU-bound computation (no blocking calls).
- * Measures and reports execution time as a function of scheduling policy.
- *
-*/
+ * RTOS-06 Exercise – Part 3 & 4  (3 processes per policy)
+ */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,117 +12,158 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <semaphore.h>
 
-#define NUM_POLICIES   3
-#define FIXED_PRIORITY 20
-#define WORKLOAD       50000000UL // 50M
+#define PROCS_PER_POLICY  3
+#define NUM_POLICIES      3
+#define NUM_CHILDREN      (NUM_POLICIES * PROCS_PER_POLICY)   /* 9 */
+#define FIXED_PRIORITY    20
+#define WORKLOAD          50000000UL
 
-// Policy table 
-static const int   policies[NUM_POLICIES]      = { SCHED_FIFO, SCHED_RR, SCHED_SPORADIC };
-static const char *policy_names[NUM_POLICIES]  = { "SCHED_FIFO", "SCHED_RR (Round Robin)", "SCHED_SPORADIC" };
+static const int   policies[NUM_POLICIES]     = { SCHED_FIFO, SCHED_RR, SCHED_SPORADIC };
+static const char *policy_names[NUM_POLICIES] = { "SCHED_FIFO", "SCHED_RR", "SCHED_SPORADIC" };
 
 typedef struct {
-    int    policy_id;
+    int    policy_idx;
+    int    instance;
+    pid_t  pid;
+    int    start_rank;
+    int    finish_rank;
     double elapsed_sec;
     int    actual_policy;
 } Result;
+
+typedef struct {
+    sem_t  gate_sem;
+    sem_t  ready_sem;
+    int    start_counter;
+    int    finish_counter;
+} Gate;
 
 static volatile unsigned long sink = 0;
 
 static void cpu_work(unsigned long n)
 {
     unsigned long i, acc = 0;
-    for (i = 0; i < n; ++i) {
+    for (i = 0; i < n; ++i)
         acc += i * i + (i ^ 0xCAFEBABEUL);
-    }
     sink = acc;
 }
 
 int main(void)
 {
-    const char *shm_name = "/rtos06_sched_shm";
-    int    shm_fd;
+    const char *shm_results_name = "/rtos06_sched_results";
+    const char *shm_gate_name    = "/rtos06_sched_gate";
+
+    int     res_fd, gate_fd;
     Result *results;
-    pid_t   pids[NUM_POLICIES];
+    Gate   *gate;
+    pid_t   pids[NUM_CHILDREN];
     int     i, status;
 
-    shm_fd = shm_open(shm_name, O_CREAT | O_RDWR, 0600);
-    if (shm_fd == -1) { perror("shm_open"); return EXIT_FAILURE; }
-    if (ftruncate(shm_fd, sizeof(Result) * NUM_POLICIES) == -1) {
-        perror("ftruncate"); shm_unlink(shm_name); return EXIT_FAILURE;
+    res_fd = shm_open(shm_results_name, O_CREAT | O_RDWR, 0600);
+    if (res_fd == -1) { perror("shm_open results"); return EXIT_FAILURE; }
+    if (ftruncate(res_fd, sizeof(Result) * NUM_CHILDREN) == -1) {
+        perror("ftruncate results"); shm_unlink(shm_results_name); return EXIT_FAILURE;
     }
-    results = (Result *)mmap(NULL, sizeof(Result) * NUM_POLICIES,
-                             PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    results = mmap(NULL, sizeof(Result) * NUM_CHILDREN,
+                   PROT_READ | PROT_WRITE, MAP_SHARED, res_fd, 0);
     if (results == MAP_FAILED) {
-        perror("mmap"); shm_unlink(shm_name); return EXIT_FAILURE;
+        perror("mmap results"); shm_unlink(shm_results_name); return EXIT_FAILURE;
     }
 
-    printf("=== RTOS-06: Scheduling Algorithm vs Execution Time ===\n");
-    printf("All processes: priority = %d, workload = %lu iterations\n\n", FIXED_PRIORITY, WORKLOAD);
+    gate_fd = shm_open(shm_gate_name, O_CREAT | O_RDWR, 0600);
+    if (gate_fd == -1) { perror("shm_open gate"); return EXIT_FAILURE; }
+    if (ftruncate(gate_fd, sizeof(Gate)) == -1) {
+        perror("ftruncate gate"); shm_unlink(shm_gate_name); return EXIT_FAILURE;
+    }
+    gate = mmap(NULL, sizeof(Gate), PROT_READ | PROT_WRITE, MAP_SHARED, gate_fd, 0);
+    if (gate == MAP_FAILED) {
+        perror("mmap gate"); shm_unlink(shm_gate_name); return EXIT_FAILURE;
+    }
 
-    /* --- fork one child per policy --------------------------------- */
-    for (i = 0; i < NUM_POLICIES; ++i) {
+    if (sem_init(&gate->gate_sem,  1, 0) == -1) { perror("sem_init gate");  return EXIT_FAILURE; }
+    if (sem_init(&gate->ready_sem, 1, 0) == -1) { perror("sem_init ready"); return EXIT_FAILURE; }
+    gate->start_counter  = 0;
+    gate->finish_counter = 0;
+
+    for (i = 0; i < NUM_CHILDREN; ++i) {
+        int pol_idx  = i / PROCS_PER_POLICY;
+        int instance = i % PROCS_PER_POLICY;
+
         pids[i] = fork();
-        if (pids[i] < 0) {
-            perror("fork");
-            shm_unlink(shm_name);
-            return EXIT_FAILURE;
-        }
+        if (pids[i] < 0) { perror("fork"); return EXIT_FAILURE; }
 
         if (pids[i] == 0) {
             struct sched_param sp;
             struct timeval     t_start, t_end;
-            int ret;
 
-            int cfd = shm_open(shm_name, O_RDWR, 0600);
-            Result *cres = (Result *)mmap(NULL, sizeof(Result) * NUM_POLICIES, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, 0);
+            int     cres_fd  = shm_open(shm_results_name, O_RDWR, 0600);
+            int     cgate_fd = shm_open(shm_gate_name,    O_RDWR, 0600);
+            Result *cres  = mmap(NULL, sizeof(Result) * NUM_CHILDREN, PROT_READ | PROT_WRITE, MAP_SHARED, cres_fd, 0);
+            Gate   *cgate = mmap(NULL, sizeof(Gate), PROT_READ | PROT_WRITE, MAP_SHARED, cgate_fd, 0);
 
             memset(&sp, 0, sizeof(sp));
             sp.sched_priority = FIXED_PRIORITY;
-
-            ret = sched_setscheduler(0, policies[i], &sp);
-            if (ret == -1) {
-                fprintf(stderr, "[child %d] sched_setscheduler(%s) failed: %s\n",
-                        i, policy_names[i], strerror(errno));
-                // still run and record whatever policy was inherited
+            if (sched_setscheduler(0, policies[pol_idx], &sp) == -1) {
+                printf("[child %d] sched_setscheduler(%s) failed: %s\n",
+                        i, policy_names[pol_idx], strerror(errno));
             }
 
+            cres[i].policy_idx    = pol_idx;
+            cres[i].instance      = instance;
+            cres[i].pid           = getpid();
             cres[i].actual_policy = sched_getscheduler(0);
-            cres[i].policy_id     = i;
+
+            sem_post(&cgate->ready_sem);
+            if (sem_wait(&cgate->gate_sem) == -1) {
+            	perror("sem_wait");
+            	exit(EXIT_FAILURE);
+            }
+
+            cres[i].start_rank = __sync_fetch_and_add(&cgate->start_counter, 1) + 1;
 
             gettimeofday(&t_start, NULL);
             cpu_work(WORKLOAD);
             gettimeofday(&t_end, NULL);
 
-            cres[i].elapsed_sec = (t_end.tv_sec  - t_start.tv_sec) +
-                                  (t_end.tv_usec - t_start.tv_usec) * 1e-6;
+            cres[i].finish_rank  = __sync_fetch_and_add(&cgate->finish_counter, 1) + 1;
+            cres[i].elapsed_sec  = (t_end.tv_sec  - t_start.tv_sec)
+                                 + (t_end.tv_usec - t_start.tv_usec) * 1e-6;
 
-            munmap(cres, sizeof(Result) * NUM_POLICIES);
-            close(cfd);
-            _exit(EXIT_SUCCESS);
+            printf("DONE  [%s :%d]  pid=%d  start=%d  finish=%d  %.6f s\n",
+                   policy_names[pol_idx], instance, (int)getpid(),
+                   cres[i].start_rank, cres[i].finish_rank, cres[i].elapsed_sec);
+
+            munmap(cres,  sizeof(Result) * NUM_CHILDREN);
+            munmap(cgate, sizeof(Gate));
+            close(cres_fd);
+            close(cgate_fd);
+            exit(EXIT_SUCCESS);
         }
     }
 
-    for (i = 0; i < NUM_POLICIES; ++i) {
+    printf("Waiting for all %d children to be ready...\n", NUM_CHILDREN);
+    for (i = 0; i < NUM_CHILDREN; ++i)
+        sem_wait(&gate->ready_sem);
+
+    printf("Launching all childs\n");
+
+    for (i = 0; i < NUM_CHILDREN; ++i)
+        sem_post(&gate->gate_sem);
+
+    for (i = 0; i < NUM_CHILDREN; ++i)
         waitpid(pids[i], &status, 0);
-    }
 
-    for (i = 0; i < NUM_POLICIES; ++i) {
-        printf("%s: %.6f seconds (code: %d)\n", policy_names[i], results[i].elapsed_sec, results[i].actual_policy);
-    }
-
-    /* Key observations:
-     * SCHED_FIFO – runs until it voluntarily yields or is preempted; no timeslice limit at same priority.
-     * SCHED_RR – same as FIFO but preempted after a timeslice; other ready processes of equal priority get a turn.
-     * SCHED_SPORADIC – priority decays by 1 after each budget exhaustion; restored on the next blocking event.
-     * With a single CPU-bound process per policy the times should be similar;
-     * the difference becomes pronounced when multiple processes of the SAME priority compete for the CPU.
-     */
-
-    // clean
-    munmap(results, sizeof(Result) * NUM_POLICIES);
-    close(shm_fd);
-    shm_unlink(shm_name);
+    /* Cleanup */
+    munmap(results, sizeof(Result) * NUM_CHILDREN);
+    munmap(gate,    sizeof(Gate));
+    close(res_fd);
+    close(gate_fd);
+    sem_destroy(&gate->gate_sem);
+    sem_destroy(&gate->ready_sem);
+    shm_unlink(shm_results_name);
+    shm_unlink(shm_gate_name);
 
     return EXIT_SUCCESS;
 }
