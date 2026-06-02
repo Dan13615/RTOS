@@ -1,5 +1,10 @@
 /*
  * RTOS-06 Exercise – Part 1 & 2
+ *
+ * Fork 10 children with priorities 10..100. Shared memory holds the per-child
+ * results; a shared semaphore (gate) releases every child at the same instant
+ * so their run times can be compared fairly. Each child times its own CPU loop
+ * with gettimeofday and the parent prints the time for every priority.
  */
 
 #include <stdio.h>
@@ -21,18 +26,21 @@ static const int priorities[NUM_PROCESSES] = {
     10, 20, 30, 40, 50, 60, 70, 80, 90, 100
 };
 
-/* Per-child result */
+/* Per-child result written into shared memory */
 typedef struct {
     int    priority;
     double elapsed_sec;
 } Result;
 
+/* Gate semaphore shared between parent and children */
 typedef struct {
     sem_t sem;
 } Gate;
 
+/* volatile sink: stops the compiler from optimising the work loop away */
 static volatile unsigned long sink = 0;
 
+/* Pure CPU loop, no blocking calls, so finish order depends only on priority */
 static void cpu_work(unsigned long n)
 {
     unsigned long i, acc = 0;
@@ -75,15 +83,18 @@ int main(void)
         perror("mmap gate"); shm_unlink(shm_gate_name); return EXIT_FAILURE;
     }
 
+    /* process-shared (pshared=1), starts at 0 so children block on it */
     if (sem_init(&gate->sem, 1, 0) == -1) {
         perror("sem_init"); return EXIT_FAILURE;
     }
 
+    /* Create the 10 children */
     for (i = 0; i < NUM_PROCESSES; ++i) {
         pids[i] = fork();
         if (pids[i] < 0) { perror("fork"); return EXIT_FAILURE; }
 
         if (pids[i] == 0) {
+            /* child: map the same shared memory the parent created */
             struct sched_param sp;
             struct timeval     t_start, t_end;
 
@@ -94,6 +105,7 @@ int main(void)
             Gate   *cgate = mmap(NULL, sizeof(Gate),
                                  PROT_READ | PROT_WRITE, MAP_SHARED, cgate_fd, 0);
 
+            /* Set this child's priority */
             memset(&sp, 0, sizeof(sp));
             sp.sched_priority = priorities[i];
             if (sched_setscheduler(0, SCHED_SPORADIC, &sp) == -1)
@@ -101,8 +113,10 @@ int main(void)
 
             printf("READY  priority=%d  pid=%d\n", priorities[i], getpid());
 
+            /* Block until the parent opens the gate (all children start together) */
             if (sem_wait(&cgate->sem) == -1) { perror("sem_wait"); _exit(EXIT_FAILURE); }
 
+            /* Time the work this child does itself */
             gettimeofday(&t_start, NULL);
             cpu_work(WORKLOAD);
             gettimeofday(&t_end, NULL);
@@ -110,6 +124,7 @@ int main(void)
             double elapsed = (t_end.tv_sec  - t_start.tv_sec)
                            + (t_end.tv_usec - t_start.tv_usec) * 1e-6;
 
+            /* Publish result to shared memory for the parent to read */
             cres[i].priority    = priorities[i];
             cres[i].elapsed_sec = elapsed;
 
@@ -123,9 +138,11 @@ int main(void)
         }
     }
 
+    /* Give every child time to reach sem_wait, then release them at once */
     printf("\nAll children ready releasing in 2 s...\n\n");
     sleep(2);
 
+    /* One post per child opens the gate for all of them */
     for (i = 0; i < NUM_PROCESSES; ++i)
         sem_post(&gate->sem);
 
@@ -133,7 +150,7 @@ int main(void)
     for (i = 0; i < NUM_PROCESSES; ++i)
         waitpid(pids[i], &status, 0);
 
-    /* Report */
+    /* Report the time recorded for every priority */
     printf("\n=== Results ===\n");
     for (i = 0; i < NUM_PROCESSES; ++i)
         printf("Priority %3d: %.6f seconds\n",
