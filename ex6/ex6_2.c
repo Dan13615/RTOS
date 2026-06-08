@@ -1,5 +1,5 @@
 /*
- * RTOS-06 Exercise – Part 3 & 4  (3 processes per policy)
+ * RTOS-06 Exercise - Part 3 and 4  (3 processes per policy)
  *
  * Fork 9 children, 3 per policy (SCHED_FIFO, SCHED_RR, SCHED_SPORADIC), all at
  * the same priority 20. Two semaphores: ready_sem lets the parent know every
@@ -7,6 +7,10 @@
  * start and finish rank with an atomic counter to show the start/finish order,
  * and reads back its real policy with sched_getscheduler. The work is a plain
  * loop with no blocking calls, so finish order depends only on the policy.
+ *
+ * The parent runs at a higher priority than the children, so it can post all
+ * gate semaphores before any child runs. The children then contend together
+ * once the parent blocks on waitpid.
  */
 
 #include <stdio.h>
@@ -21,9 +25,8 @@
 #include <fcntl.h>
 #include <semaphore.h>
 
-#define PROCS_PER_POLICY  3
 #define NUM_POLICIES      3
-#define NUM_CHILDREN      (NUM_POLICIES * PROCS_PER_POLICY)   /* 9 */
+#define NUM_CHILDREN      10    /* 10 children spread across the 3 policies */
 #define FIXED_PRIORITY    20
 #define WORKLOAD          50000000UL
 
@@ -99,10 +102,22 @@ int main(void)
     gate->start_counter  = 0;
     gate->finish_counter = 0;
 
+    /* Parent runs above the children so it can post every gate before any
+       child runs. Without this the first released child preempts the parent
+       and runs to completion, so the children never contend. */
+    {
+        struct sched_param psp;
+        memset(&psp, 0, sizeof(psp));
+        psp.sched_priority = FIXED_PRIORITY + 10;
+        if (sched_setscheduler(0, SCHED_FIFO, &psp) == -1)
+            perror("sched_setscheduler parent");
+    }
+
     for (i = 0; i < NUM_CHILDREN; ++i) {
-        /* 3 children per policy, all sharing one priority */
-        int pol_idx  = i / PROCS_PER_POLICY;
-        int instance = i % PROCS_PER_POLICY;
+        /* round-robin policy assignment, all children share one priority.
+           With 10 children this gives 4 FIFO, 3 RR, 3 SPORADIC. */
+        int pol_idx  = i % NUM_POLICIES;
+        int instance = i / NUM_POLICIES;
 
         pids[i] = fork();
         if (pids[i] < 0) { perror("fork"); return EXIT_FAILURE; }
@@ -123,6 +138,11 @@ int main(void)
             if (sched_setscheduler(0, policies[pol_idx], &sp) == -1) {
                 printf("[child %d] sched_setscheduler(%s) failed: %s\n",
                         i, policy_names[pol_idx], strerror(errno));
+                /* Policy not available on this QNX. Keep the comparison fair
+                   by forcing the same priority, otherwise this child stays at
+                   the inherited parent priority and runs ahead of the others. */
+                if (sched_setparam(0, &sp) == -1)
+                    perror("sched_setparam fallback");
             }
 
             cres[i].policy_idx    = pol_idx;
@@ -175,13 +195,13 @@ int main(void)
     for (i = 0; i < NUM_CHILDREN; ++i)
         waitpid(pids[i], &status, 0);
 
-    /* Cleanup */
+    /* Cleanup: destroy the semaphores before unmapping the gate memory */
+    sem_destroy(&gate->gate_sem);
+    sem_destroy(&gate->ready_sem);
     munmap(results, sizeof(Result) * NUM_CHILDREN);
     munmap(gate,    sizeof(Gate));
     close(res_fd);
     close(gate_fd);
-    sem_destroy(&gate->gate_sem);
-    sem_destroy(&gate->ready_sem);
     shm_unlink(shm_results_name);
     shm_unlink(shm_gate_name);
 
