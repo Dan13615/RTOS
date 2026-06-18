@@ -88,42 +88,109 @@
 
 /* Standard includes. */
 #include <stdio.h>
-#include <stdlib.h>
 
 #include "FreeRTOS.h"
+#include "queue.h"
 #include "task.h"
 
 /* Some definitions */
-#define mainTIMER_TEST_PERIOD			( 50 )
+#define mainQUEUE_LENGTH				( 1 )
+
+// time based define
+#define SEND_DELAY				( 2000 ) // 2000
+#define RECEIVE_DELAY				( 500 )
+
+#define SEND_TIMEOUT    pdMS_TO_TICKS( 1000 ) // 1000
+#define RECEIVE_TIMEOUT pdMS_TO_TICKS( 500 )
+
+
+#define mainARRAY_LENGTH				( 5 )
+#define mainSTRING_LENGTH				( 50 )
+
+
 
 /*-----------------------------------------------------------*/
 static void xStartTask_1( void *pvParameters )
 {
-	int	counter = 0;
-	const	TickType_t xDelay = 1000/portTICK_PERIOD_MS;
-
-	/* Just to remove compiler warning. */
-	( void ) pvParameters;
+	QueueHandle_t *xQueues = ( QueueHandle_t * ) pvParameters;
+	int xInteger = 0;
+	int xArray[ mainARRAY_LENGTH ];
+	char pcString[ mainSTRING_LENGTH ];
+	int xIndex;
+	const TickType_t xDelay = pdMS_TO_TICKS( SEND_DELAY );
 
 	for( ;; ) {
-		vTaskDelay(xDelay);
-		printf( "Task 1 - Next loop (each 1000ms) %d\r\n", counter++ );
+		for( xIndex = 0; xIndex < mainARRAY_LENGTH; xIndex++ ) {
+			xArray[ xIndex ] = xInteger + xIndex;
+		}
+
+		snprintf( pcString, mainSTRING_LENGTH,
+				  "this is a string number %d", xInteger );
+
+		vTaskDelay( xDelay );
+
+		// maximum delay, wait infinite time until has space.
+		// xQueueSend( xQueues[ 0 ], &xInteger, portMAX_DELAY );
+		// xQueueSend( xQueues[ 1 ], xArray, portMAX_DELAY );
+		// xQueueSend( xQueues[ 2 ], pcString, portMAX_DELAY );
+
+		// now timeout a certain amount of time, if the queue is full, then skip sending.
+		if( xQueueSend( xQueues[ 0 ], &xInteger, SEND_TIMEOUT ) != pdPASS ) {
+			printf( "Send timeout INTEGER\r\n" );
+		}
+		if (xQueueSend( xQueues[ 1 ], xArray, SEND_TIMEOUT ) != pdPASS ) {
+			printf( "Send timeout ARRAY\r\n" );
+		}
+		if (xQueueSend( xQueues[ 2 ], pcString, SEND_TIMEOUT ) != pdPASS ) {
+			printf( "Send timeout STRING\r\n" );
+		}
+
+		xInteger++;
 	}
 }
 
 
 /*-----------------------------------------------------------*/
-
 static void xStartTask_2( void *pvParameters )
 {
-	int	counter = 0;
-	const	TickType_t xDelay = 250/portTICK_PERIOD_MS;
-
-	( void ) pvParameters;
+	QueueHandle_t *xQueues = ( QueueHandle_t * ) pvParameters;
+	int xInteger;
+	int xArray[ mainARRAY_LENGTH ];
+	char pcString[ mainSTRING_LENGTH ];
+	int xIndex;
+	const TickType_t xDelay = pdMS_TO_TICKS( RECEIVE_DELAY );
 
 	for( ;; ) {
-		vTaskDelay(xDelay);
-		printf( "Task 2 - Next loop (each 250ms) %d\r\n", counter++ );
+
+		// 0 timeout mean return imediate, RECEIVE_TIMEOUT mean wait a certain amount of time, if the queue is empty +time is passed, then skip receiving.
+		//if( xQueueReceive( xQueues[ 1 ], xArray, 0 ) == pdPASS )
+		if( xQueueReceive( xQueues[ 0 ], &xInteger, RECEIVE_TIMEOUT) == pdPASS ) {
+			printf( "int: %d\r\n", xInteger );
+		} else {
+			printf( "int queue empty\r\n" );
+		}
+
+		//if( xQueueReceive( xQueues[ 1 ], xArray, 0 ) == pdPASS )
+		if( xQueueReceive( xQueues[ 1 ], xArray, RECEIVE_TIMEOUT) == pdPASS ) {
+			printf( "Array:" );
+			for( xIndex = 0; xIndex < mainARRAY_LENGTH; xIndex++ ) {
+				printf( " %d", xArray[ xIndex ] );
+			}
+			printf( "\r\n" );
+		} else {
+			printf( "arr queue empty\r\n" );
+		}
+
+		// if( xQueueReceive( xQueues[ 2 ], pcString, 0 ) == pdPASS
+		if( xQueueReceive( xQueues[ 2 ], pcString, RECEIVE_TIMEOUT ) == pdPASS ){
+			printf( "string: %s\r\n", pcString );
+		} else {
+			printf( "string queue empty\r\n" );
+		}
+
+		printf( "\r\n" );
+		fflush( stdout );
+		vTaskDelay( xDelay );
 	}
 }
 
@@ -131,9 +198,19 @@ static void xStartTask_2( void *pvParameters )
 
 int main ( void )
 {
+	QueueHandle_t xQueues[ 3 ];
 
-	xTaskCreate( xStartTask_1, "Task_1", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
-	xTaskCreate( xStartTask_2, "Task_2", configMINIMAL_STACK_SIZE, NULL, 1, NULL );
+	xQueues[ 0 ] = xQueueCreate( mainQUEUE_LENGTH, sizeof( int ) );
+	xQueues[ 1 ] = xQueueCreate( mainQUEUE_LENGTH,
+								sizeof( int ) * mainARRAY_LENGTH );
+	xQueues[ 2 ] = xQueueCreate( mainQUEUE_LENGTH,
+								mainSTRING_LENGTH * sizeof( char ) );
+
+	/* Create the tasks defined within this file. */
+	xTaskCreate( xStartTask_1, "Task_1", configMINIMAL_STACK_SIZE,
+				 xQueues, 1, NULL );
+	xTaskCreate( xStartTask_2, "Task_2", configMINIMAL_STACK_SIZE,
+				 xQueues, 1, NULL );
 
 	/* Start the scheduler itself. */
 	vTaskStartScheduler();
@@ -143,4 +220,3 @@ int main ( void )
 	return 0;
 }
 /*-----------------------------------------------------------*/
-
